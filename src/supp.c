@@ -40,6 +40,13 @@ const supported_algo_t supp_crypt[] = {
     {"aes128", GCRY_CIPHER_AES128, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 128},
     {"aes192", GCRY_CIPHER_AES192, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 192},
     {"aes256", GCRY_CIPHER_AES256, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 256},
+    /*
+     * AEAD, ESP only: ike_sa_id is 0 because these are never offered for
+     * phase 1, and the trailing 16 is the ICV length ESP_AES_GCM_16 asks for.
+     */
+    {"aes128-gcm", GCRY_CIPHER_AES128, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 128},
+    {"aes192-gcm", GCRY_CIPHER_AES192, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 192},
+    {"aes256-gcm", GCRY_CIPHER_AES256, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 256},
     {NULL, 0, 0, 0, 0}};
 
 const supported_algo_t supp_auth[] = {
@@ -52,6 +59,20 @@ const supported_algo_t supp_auth[] = {
 #endif /* 0 */
     {"hybrid(rsa)", 0, IKE_AUTH_HybridInitRSA, 0, 0},
     {NULL, 0, 0, 0, 0}};
+
+int esp_aead_icv_len(int ipsec_sa_id)
+{
+	switch (ipsec_sa_id) {
+	case ISAKMP_IPSEC_ESP_AES_GCM_8:
+		return 8;
+	case ISAKMP_IPSEC_ESP_AES_GCM_12:
+		return 12;
+	case ISAKMP_IPSEC_ESP_AES_GCM_16:
+		return 16;
+	default:
+		return 0;
+	}
+}
 
 const supported_algo_t *get_algo(enum algo_group what, enum supp_algo_key key, int id,
 				 const char *name, int keylen)

@@ -31,6 +31,7 @@ struct ike_sa {
 	uint8_t *key_cry;
 	gcry_cipher_hd_t cry_ctx;
 	uint8_t *key_md;
+	uint8_t salt[4]; /* AEAD: the implicit part of the nonce */
 
 	/* Description of the packet being processed */
 	unsigned char *buf;
@@ -102,6 +103,8 @@ struct sa_block {
 		int cry_algo, md_algo;
 		size_t key_len, md_len;
 		size_t blk_len, iv_len;
+		size_t salt_len; /* AEAD: extra keymat past the cipher key */
+		int aead_icv_len; /* AEAD: ICV length, 0 when not AEAD */
 		uint16_t encap_mode;
 		uint16_t peer_udpencap_port;
 		enum natt_active_mode_enum natt_active_mode;

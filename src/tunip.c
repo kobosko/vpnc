@@ -324,7 +324,24 @@ static void encap_esp_encapsulate(struct sa_block *s)
 
 	hex_dump("sending ESP packet (before crypt)", s->ipsec.tx.buf, s->ipsec.tx.buflen, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.aead_icv_len) {
+		/*
+		 * RFC 4106: the nonce is the salt from the key material followed
+		 * by the explicit IV carried in the packet, and the ESP header is
+		 * authenticated but not encrypted.
+		 */
+		unsigned char nonce[4 + 8];
+
+		memcpy(nonce, s->ipsec.tx.salt, s->ipsec.salt_len);
+		memcpy(nonce + s->ipsec.salt_len, iv, s->ipsec.iv_len);
+		gcry_cipher_reset(s->ipsec.tx.cry_ctx);
+		gcry_cipher_setiv(s->ipsec.tx.cry_ctx, nonce, s->ipsec.salt_len + s->ipsec.iv_len);
+		gcry_cipher_authenticate(s->ipsec.tx.cry_ctx, eh, sizeof(*eh));
+		gcry_cipher_encrypt(s->ipsec.tx.cry_ctx, cleartext, cleartextlen, NULL, 0);
+		gcry_cipher_gettag(s->ipsec.tx.cry_ctx, s->ipsec.tx.buf + s->ipsec.tx.buflen,
+				   s->ipsec.aead_icv_len);
+		s->ipsec.tx.buflen += s->ipsec.aead_icv_len;
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_setiv(s->ipsec.tx.cry_ctx, iv, s->ipsec.iv_len);
 		gcry_cipher_encrypt(s->ipsec.tx.cry_ctx, cleartext, cleartextlen, NULL, 0);
 	}
@@ -579,6 +596,35 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 		}
 	}
 
+	if (s->ipsec.aead_icv_len) {
+		unsigned char nonce[4 + 8];
+		unsigned char *data;
+		esp_encap_header_t *eh;
+
+		len -= s->ipsec.aead_icv_len;
+		if (len < 0) {
+			logmsg(LOG_ALERT, "Packet too short for the ICV");
+			return -1;
+		}
+		s->ipsec.rx.buflen -= s->ipsec.aead_icv_len;
+
+		eh = (esp_encap_header_t *)(s->ipsec.rx.buf + s->ipsec.rx.bufpayload);
+		data = s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size +
+		    s->ipsec.rx.var_header_size;
+
+		memcpy(nonce, s->ipsec.rx.salt, s->ipsec.salt_len);
+		memcpy(nonce + s->ipsec.salt_len, iv, s->ipsec.iv_len);
+		gcry_cipher_reset(s->ipsec.rx.cry_ctx);
+		gcry_cipher_setiv(s->ipsec.rx.cry_ctx, nonce, s->ipsec.salt_len + s->ipsec.iv_len);
+		gcry_cipher_authenticate(s->ipsec.rx.cry_ctx, eh, sizeof(*eh));
+		gcry_cipher_decrypt(s->ipsec.rx.cry_ctx, data, len, NULL, 0);
+		if (gcry_cipher_checktag(s->ipsec.rx.cry_ctx, data + len, s->ipsec.aead_icv_len)) {
+			logmsg(LOG_ALERT, "ICV mismatch in ESP mode");
+			return -1;
+		}
+	}
+
+	/* Only count a packet against the replay window once it is authentic. */
 	if (encap_esp_validate_seqid(s, seq_id))
 		return -1;
 
@@ -595,7 +641,7 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 				  s->ipsec.rx.var_header_size],
 		 len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.cry_algo && !s->ipsec.aead_icv_len) {
 		unsigned char *data;
 
 		data = (s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size);
@@ -1102,7 +1148,13 @@ void vpnc_doit(struct sa_block *s)
 	s->ipsec.rx.key_md = s->ipsec.rx.key + s->ipsec.key_len;
 	hex_dump("rx.key_md", s->ipsec.rx.key_md, s->ipsec.md_len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.salt_len)
+		memcpy(s->ipsec.rx.salt, s->ipsec.rx.key + s->ipsec.key_len, s->ipsec.salt_len);
+
+	if (s->ipsec.aead_icv_len) {
+		gcry_cipher_open(&s->ipsec.rx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_GCM, 0);
+		gcry_cipher_setkey(s->ipsec.rx.cry_ctx, s->ipsec.rx.key_cry, s->ipsec.key_len);
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_open(&s->ipsec.rx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_CBC, 0);
 		gcry_cipher_setkey(s->ipsec.rx.cry_ctx, s->ipsec.rx.key_cry, s->ipsec.key_len);
 	} else {
@@ -1115,7 +1167,13 @@ void vpnc_doit(struct sa_block *s)
 	s->ipsec.tx.key_md = s->ipsec.tx.key + s->ipsec.key_len;
 	hex_dump("tx.key_md", s->ipsec.tx.key_md, s->ipsec.md_len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.salt_len)
+		memcpy(s->ipsec.tx.salt, s->ipsec.tx.key + s->ipsec.key_len, s->ipsec.salt_len);
+
+	if (s->ipsec.aead_icv_len) {
+		gcry_cipher_open(&s->ipsec.tx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_GCM, 0);
+		gcry_cipher_setkey(s->ipsec.tx.cry_ctx, s->ipsec.tx.key_cry, s->ipsec.key_len);
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_open(&s->ipsec.tx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_CBC, 0);
 		gcry_cipher_setkey(s->ipsec.tx.cry_ctx, s->ipsec.tx.key_cry, s->ipsec.key_len);
 	} else {
