@@ -199,6 +199,23 @@ static void run_script(const char *reason)
 		DEBUG(2, printf("%s script returned %d\n", reason, WEXITSTATUS(ret)));
 }
 
+/*
+ * select(2) and poll(2) may report a UDP socket as readable and leave the
+ * recv that follows blocking anyway: the datagram they saw can be discarded
+ * before we get to it, for instance for a bad checksum. Without a timeout
+ * that stalls the tunnel for good, so bound the wait and let the caller
+ * treat it as "nothing arrived".
+ */
+static void set_recv_timeout(int sock)
+{
+	struct timeval tv;
+
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+	if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+		DEBUG(1, printf("could not set receive timeout: %s\n", strerror(errno)));
+}
+
 static int make_socket(struct sa_block *s, uint16_t src_port, uint16_t dst_port)
 {
 	int sock;
@@ -228,6 +245,8 @@ static int make_socket(struct sa_block *s, uint16_t src_port, uint16_t dst_port)
 	name.sin_port = htons(dst_port);
 	if (connect(sock, (struct sockaddr *)&name, sizeof(name)) < 0)
 		error(1, errno, "connecting to port %d", ntohs(dst_port));
+
+	set_recv_timeout(sock);
 
 	/* who am I */
 	if (getsockname(sock, (struct sockaddr *)&name, &len) < 0)
@@ -394,8 +413,11 @@ static int recv_ignore_dup(struct sa_block *s, void *recvbuf, size_t recvbufsize
 	int recvsize, hash_len;
 
 	recvsize = recv(s->ike_fd, recvbuf, recvbufsize, 0);
-	if (recvsize < 0)
+	if (recvsize < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return -1; /* the socket was not readable after all */
 		error(1, errno, "receiving packet");
+	}
 	if ((unsigned int)recvsize > recvbufsize)
 		error(1, errno, "received packet too large for buffer");
 
@@ -2971,6 +2993,8 @@ static void do_phase2_qm(struct sa_block *s)
 #endif
 
 				s->esp_fd = socket(PF_INET, SOCK_RAW, IPPROTO_ESP);
+				if (s->esp_fd >= 0)
+					set_recv_timeout(s->esp_fd);
 				if (s->esp_fd == -1)
 					error(1, errno, "Couldn't open socket of ESP. Maybe something registered ESP already.\nPlease try '--natt-mode force-natt' or disable whatever is using ESP.\nsocket(PF_INET, SOCK_RAW, IPPROTO_ESP)");
 #ifdef FD_CLOEXEC

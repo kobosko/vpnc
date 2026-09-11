@@ -133,7 +133,8 @@ static int encap_rawip_recv(struct sa_block *s, unsigned char *buf, unsigned int
 
 	r = recvfrom(s->esp_fd, buf, bufsize, 0, (struct sockaddr *)&from, &fromlen);
 	if (r == -1) {
-		logmsg(LOG_ERR, "recvfrom: %m");
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			logmsg(LOG_ERR, "recvfrom: %m");
 		return -1;
 	}
 	if (from.sin_addr.s_addr != s->dst.s_addr) {
@@ -167,7 +168,8 @@ static int encap_udp_recv(struct sa_block *s, unsigned char *buf, unsigned int b
 
 	r = recv(s->esp_fd, buf, bufsize, 0);
 	if (r == -1) {
-		logmsg(LOG_ERR, "recvfrom: %m");
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			logmsg(LOG_ERR, "recv: %m");
 		return -1;
 	}
 	if (s->ipsec.natt_active_mode == NATT_ACTIVE_DRAFT_OLD && r > 8) {
