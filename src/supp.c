@@ -31,6 +31,9 @@ const supported_algo_t supp_dh_group[] = {
 const supported_algo_t supp_hash[] = {
     {"md5", GCRY_MD_MD5, IKE_HASH_MD5, IPSEC_AUTH_HMAC_MD5, 0},
     {"sha1", GCRY_MD_SHA1, IKE_HASH_SHA, IPSEC_AUTH_HMAC_SHA, 0},
+    {"sha256", GCRY_MD_SHA256, IKE_HASH_SHA2_256, IPSEC_AUTH_HMAC_SHA2_256, 0},
+    {"sha384", GCRY_MD_SHA384, IKE_HASH_SHA2_384, IPSEC_AUTH_HMAC_SHA2_384, 0},
+    {"sha512", GCRY_MD_SHA512, IKE_HASH_SHA2_512, IPSEC_AUTH_HMAC_SHA2_512, 0},
     {NULL, 0, 0, 0, 0}};
 
 const supported_algo_t supp_crypt[] = {
@@ -40,6 +43,13 @@ const supported_algo_t supp_crypt[] = {
     {"aes128", GCRY_CIPHER_AES128, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 128},
     {"aes192", GCRY_CIPHER_AES192, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 192},
     {"aes256", GCRY_CIPHER_AES256, IKE_ENC_AES_CBC, ISAKMP_IPSEC_ESP_AES, 256},
+    /*
+     * AEAD, ESP only: ike_sa_id is 0 because these are never offered for
+     * phase 1, and the trailing 16 is the ICV length ESP_AES_GCM_16 asks for.
+     */
+    {"aes128-gcm", GCRY_CIPHER_AES128, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 128},
+    {"aes192-gcm", GCRY_CIPHER_AES192, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 192},
+    {"aes256-gcm", GCRY_CIPHER_AES256, 0, ISAKMP_IPSEC_ESP_AES_GCM_16, 256},
     {NULL, 0, 0, 0, 0}};
 
 const supported_algo_t supp_auth[] = {
@@ -52,6 +62,39 @@ const supported_algo_t supp_auth[] = {
 #endif /* 0 */
     {"hybrid(rsa)", 0, IKE_AUTH_HybridInitRSA, 0, 0},
     {NULL, 0, 0, 0, 0}};
+
+/*
+ * ICV length in bytes an ESP integrity algorithm is truncated to. RFC 2403
+ * and RFC 2404 cut MD5 and SHA-1 down to 96 bits; RFC 4868 cuts the SHA-2
+ * family to half the digest instead, so the length is no longer a constant.
+ */
+int esp_icv_len(int md_algo)
+{
+	switch (md_algo) {
+	case GCRY_MD_SHA256:
+		return 16;
+	case GCRY_MD_SHA384:
+		return 24;
+	case GCRY_MD_SHA512:
+		return 32;
+	default:
+		return 12;
+	}
+}
+
+int esp_aead_icv_len(int ipsec_sa_id)
+{
+	switch (ipsec_sa_id) {
+	case ISAKMP_IPSEC_ESP_AES_GCM_8:
+		return 8;
+	case ISAKMP_IPSEC_ESP_AES_GCM_12:
+		return 12;
+	case ISAKMP_IPSEC_ESP_AES_GCM_16:
+		return 16;
+	default:
+		return 0;
+	}
+}
 
 const supported_algo_t *get_algo(enum algo_group what, enum supp_algo_key key, int id,
 				 const char *name, int keylen)

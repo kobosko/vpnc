@@ -199,6 +199,23 @@ static void run_script(const char *reason)
 		DEBUG(2, printf("%s script returned %d\n", reason, WEXITSTATUS(ret)));
 }
 
+/*
+ * select(2) and poll(2) may report a UDP socket as readable and leave the
+ * recv that follows blocking anyway: the datagram they saw can be discarded
+ * before we get to it, for instance for a bad checksum. Without a timeout
+ * that stalls the tunnel for good, so bound the wait and let the caller
+ * treat it as "nothing arrived".
+ */
+static void set_recv_timeout(int sock)
+{
+	struct timeval tv;
+
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+	if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+		DEBUG(1, printf("could not set receive timeout: %s\n", strerror(errno)));
+}
+
 static int make_socket(struct sa_block *s, uint16_t src_port, uint16_t dst_port)
 {
 	int sock;
@@ -228,6 +245,8 @@ static int make_socket(struct sa_block *s, uint16_t src_port, uint16_t dst_port)
 	name.sin_port = htons(dst_port);
 	if (connect(sock, (struct sockaddr *)&name, sizeof(name)) < 0)
 		error(1, errno, "connecting to port %d", ntohs(dst_port));
+
+	set_recv_timeout(sock);
 
 	/* who am I */
 	if (getsockname(sock, (struct sockaddr *)&name, &len) < 0)
@@ -394,8 +413,11 @@ static int recv_ignore_dup(struct sa_block *s, void *recvbuf, size_t recvbufsize
 	int recvsize, hash_len;
 
 	recvsize = recv(s->ike_fd, recvbuf, recvbufsize, 0);
-	if (recvsize < 0)
+	if (recvsize < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return -1; /* the socket was not readable after all */
 		error(1, errno, "receiving packet");
+	}
 	if ((unsigned int)recvsize > recvbufsize)
 		error(1, errno, "received packet too large for buffer");
 
@@ -891,7 +913,7 @@ static uint8_t *gen_keymat(struct sa_block *s,
 	int blksz;
 	int cnt;
 
-	blksz = s->ipsec.md_len + s->ipsec.key_len;
+	blksz = s->ipsec.md_len + s->ipsec.key_len + s->ipsec.salt_len;
 	cnt = (blksz + s->ike.md_len - 1) / s->ike.md_len;
 	block = xallocc(cnt * s->ike.md_len);
 	DEBUG(3, printf("generating %d bytes keymat (cnt=%d)\n", blksz, cnt));
@@ -1200,6 +1222,9 @@ static struct isakmp_payload *make_our_sa_ike(void)
 				continue;
 		}
 		for (crypt = 0; supp_crypt[crypt].name != NULL; crypt++) {
+			/* AEAD ciphers are ESP only, they have no IKE id */
+			if (esp_aead_icv_len(supp_crypt[crypt].ipsec_sa_id))
+				continue;
 			if (!may_offer_crypt(&supp_crypt[crypt]))
 				continue;
 			keylen = supp_crypt[crypt].keylen;
@@ -2597,7 +2622,8 @@ static int do_phase2_config(struct sa_block *s)
 	return 0;
 }
 
-static struct isakmp_attribute *make_transform_ipsec(struct sa_block *s, int dh_group, int hash, int keylen)
+static struct isakmp_attribute *make_transform_ipsec(struct sa_block *s, int dh_group, int hash,
+						    int keylen, int is_aead)
 {
 	struct isakmp_attribute *a = NULL;
 
@@ -2610,7 +2636,9 @@ static struct isakmp_attribute *make_transform_ipsec(struct sa_block *s, int dh_
 
 	if (dh_group)
 		a = new_isakmp_attribute_16(ISAKMP_IPSEC_ATTRIB_GROUP_DESC, dh_group, a);
-	a = new_isakmp_attribute_16(ISAKMP_IPSEC_ATTRIB_AUTH_ALG, hash, a);
+	/* An AEAD cipher authenticates by itself, so it offers no AUTH_ALG. */
+	if (!is_aead)
+		a = new_isakmp_attribute_16(ISAKMP_IPSEC_ATTRIB_AUTH_ALG, hash, a);
 	a = new_isakmp_attribute_16(ISAKMP_IPSEC_ATTRIB_ENCAP_MODE, s->ipsec.encap_mode, a);
 	if (keylen != 0)
 		a = new_isakmp_attribute_16(ISAKMP_IPSEC_ATTRIB_KEY_LENGTH, keylen, a);
@@ -2630,7 +2658,14 @@ static struct isakmp_payload *make_our_sa_ipsec(struct sa_block *s)
 	r = new_isakmp_payload(ISAKMP_PAYLOAD_SA);
 	r->u.sa.doi = ISAKMP_DOI_IPSEC;
 	r->u.sa.situation = ISAKMP_IPSEC_SIT_IDENTITY_ONLY;
+	/*
+	 * The proposal list is built back to front, so walk the AEAD ciphers
+	 * last to have them offered first. They pair with no hash, so they
+	 * contribute one proposal each rather than one per hash.
+	 */
 	for (crypt = 0; supp_crypt[crypt].name != NULL; crypt++) {
+		if (esp_aead_icv_len(supp_crypt[crypt].ipsec_sa_id))
+			continue;
 		if (!may_offer_crypt(&supp_crypt[crypt]))
 			continue;
 		keylen = supp_crypt[crypt].keylen;
@@ -2646,10 +2681,26 @@ static struct isakmp_payload *make_our_sa_ipsec(struct sa_block *s)
 			p->u.p.prot_id = ISAKMP_IPSEC_PROTO_IPSEC_ESP;
 			p->u.p.transforms = new_isakmp_payload(ISAKMP_PAYLOAD_T);
 			p->u.p.transforms->u.t.id = supp_crypt[crypt].ipsec_sa_id;
-			a = make_transform_ipsec(s, dh_grp, supp_hash[hash].ipsec_sa_id, keylen);
+			a = make_transform_ipsec(s, dh_grp, supp_hash[hash].ipsec_sa_id, keylen, 0);
 			p->u.p.transforms->u.t.attributes = a;
 			p->next = pn;
 		}
+	}
+	for (crypt = 0; supp_crypt[crypt].name != NULL; crypt++) {
+		if (!esp_aead_icv_len(supp_crypt[crypt].ipsec_sa_id))
+			continue;
+		keylen = supp_crypt[crypt].keylen;
+		pn = p;
+		p = new_isakmp_payload(ISAKMP_PAYLOAD_P);
+		p->u.p.spi_size = 4;
+		p->u.p.spi = xallocc(4);
+		memcpy(p->u.p.spi, &s->ipsec.rx.spi, 4);
+		p->u.p.prot_id = ISAKMP_IPSEC_PROTO_IPSEC_ESP;
+		p->u.p.transforms = new_isakmp_payload(ISAKMP_PAYLOAD_T);
+		p->u.p.transforms->u.t.id = supp_crypt[crypt].ipsec_sa_id;
+		a = make_transform_ipsec(s, dh_grp, 0, keylen, 1);
+		p->u.p.transforms->u.t.attributes = a;
+		p->next = pn;
 	}
 	for (i = 0, pn = p; pn; pn = pn->next)
 		pn->u.p.number = i++;
@@ -2662,8 +2713,9 @@ static void do_phase2_qm(struct sa_block *s)
 	struct isakmp_payload *rp, *us, *ke = NULL, *them, *nonce_r = NULL;
 	struct isakmp_packet *r;
 	struct group *dh_grp = NULL;
+	const supported_algo_t *esp_cry = NULL;
 	uint32_t msgid;
-	int reject;
+	int reject, esp_aead = 0;
 	uint8_t nonce_i[20], *dh_public = NULL;
 
 	DEBUGTOP(2, printf("S7.1 QM_packet1\n"));
@@ -2810,27 +2862,48 @@ static void do_phase2_qm(struct sa_block *s)
 						reject = ISAKMP_N_ATTRIBUTES_NOT_SUPPORTED;
 						break;
 					}
-				if (reject == 0 && (!seen_auth || !seen_encap ||
-						    (dh_grp && !seen_group)))
+				esp_cry = get_algo(SUPP_ALGO_CRYPT, SUPP_ALGO_IPSEC_SA, seen_enc,
+						   NULL, seen_keylen);
+				esp_aead = (esp_cry != NULL && esp_aead_icv_len(esp_cry->ipsec_sa_id) != 0);
+
+				if (reject == 0 && (!seen_encap || (dh_grp && !seen_group)))
 					reject = ISAKMP_N_BAD_PROPOSAL_SYNTAX;
 
-				if (reject == 0 && get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA, seen_auth,
-							    NULL, 0) == NULL)
+				/*
+				 * An AEAD transform authenticates by itself and comes
+				 * with no AUTH_ALG; everything else must have one.
+				 */
+				if (reject == 0 && !esp_aead &&
+				    (!seen_auth || get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA,
+							    seen_auth, NULL, 0) == NULL))
 					reject = ISAKMP_N_BAD_PROPOSAL_SYNTAX;
-				if (reject == 0 && get_algo(SUPP_ALGO_CRYPT, SUPP_ALGO_IPSEC_SA, seen_enc,
-							    NULL, seen_keylen) == NULL)
+				if (reject == 0 && esp_cry == NULL)
 					reject = ISAKMP_N_BAD_PROPOSAL_SYNTAX;
 
 				if (reject == 0) {
-					s->ipsec.cry_algo =
-					    get_algo(SUPP_ALGO_CRYPT, SUPP_ALGO_IPSEC_SA,
-						     seen_enc, NULL, seen_keylen)
-						->my_id;
-					s->ipsec.md_algo =
-					    get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA,
-						     seen_auth, NULL, 0)
-						->my_id;
-					if (s->ipsec.cry_algo) {
+					s->ipsec.cry_algo = esp_cry->my_id;
+					s->ipsec.aead_icv_len = esp_aead_icv_len(esp_cry->ipsec_sa_id);
+					if (esp_aead) {
+						s->ipsec.md_algo = 0;
+						s->ipsec.salt_len = 4;
+					} else {
+						s->ipsec.md_algo =
+						    get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA,
+							     seen_auth, NULL, 0)
+							->my_id;
+						s->ipsec.salt_len = 0;
+					}
+					if (esp_aead) {
+						gcry_cipher_algo_info(s->ipsec.cry_algo, GCRYCTL_GET_KEYLEN, NULL, &(s->ipsec.key_len));
+						/*
+						 * GCM is a stream mode, but ESP still wants the
+						 * ciphertext padded to a four byte boundary, and
+						 * RFC 4106 puts an eight byte explicit nonce in
+						 * every packet.
+						 */
+						s->ipsec.blk_len = 4;
+						s->ipsec.iv_len = 8;
+					} else if (s->ipsec.cry_algo) {
 						gcry_cipher_algo_info(s->ipsec.cry_algo, GCRYCTL_GET_KEYLEN, NULL, &(s->ipsec.key_len));
 						gcry_cipher_algo_info(s->ipsec.cry_algo, GCRYCTL_GET_BLKLEN, NULL, &(s->ipsec.blk_len));
 						s->ipsec.iv_len = s->ipsec.blk_len;
@@ -2839,15 +2912,18 @@ static void do_phase2_qm(struct sa_block *s)
 						s->ipsec.iv_len = 0;
 						s->ipsec.blk_len = 8; /* seems to be this without encryption... */
 					}
-					s->ipsec.md_len = gcry_md_get_algo_dlen(s->ipsec.md_algo);
-					DEBUG(1, printf("IPSEC SA selected %s-%s\n",
-							get_algo(SUPP_ALGO_CRYPT,
-								 SUPP_ALGO_IPSEC_SA, seen_enc, NULL,
-								 seen_keylen)
-							    ->name,
-							get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA,
-								 seen_auth, NULL, 0)
-							    ->name));
+					s->ipsec.md_len = s->ipsec.md_algo ?
+					    gcry_md_get_algo_dlen(s->ipsec.md_algo) : 0;
+					s->ipsec.icv_len = s->ipsec.md_algo ?
+					    (size_t)esp_icv_len(s->ipsec.md_algo) : 0;
+					if (esp_aead)
+						DEBUG(1, printf("IPSEC SA selected %s\n", esp_cry->name));
+					else
+						DEBUG(1, printf("IPSEC SA selected %s-%s\n",
+								esp_cry->name,
+								get_algo(SUPP_ALGO_HASH, SUPP_ALGO_IPSEC_SA,
+									 seen_auth, NULL, 0)
+								    ->name));
 					switch (s->ipsec.cry_algo) {
 					case GCRY_CIPHER_NONE:
 						if (!opt_no_encryption) {
@@ -2971,6 +3047,8 @@ static void do_phase2_qm(struct sa_block *s)
 #endif
 
 				s->esp_fd = socket(PF_INET, SOCK_RAW, IPPROTO_ESP);
+				if (s->esp_fd >= 0)
+					set_recv_timeout(s->esp_fd);
 				if (s->esp_fd == -1)
 					error(1, errno, "Couldn't open socket of ESP. Maybe something registered ESP already.\nPlease try '--natt-mode force-natt' or disable whatever is using ESP.\nsocket(PF_INET, SOCK_RAW, IPPROTO_ESP)");
 #ifdef FD_CLOEXEC
@@ -3147,6 +3225,11 @@ static int do_rekey(struct sa_block *s, struct isakmp_packet *r)
 	if (s->ipsec.cry_algo) {
 		gcry_cipher_setkey(s->ipsec.rx.cry_ctx, s->ipsec.rx.key_cry, s->ipsec.key_len);
 		gcry_cipher_setkey(s->ipsec.tx.cry_ctx, s->ipsec.tx.key_cry, s->ipsec.key_len);
+	}
+
+	if (s->ipsec.salt_len) {
+		memcpy(s->ipsec.rx.salt, s->ipsec.rx.key + s->ipsec.key_len, s->ipsec.salt_len);
+		memcpy(s->ipsec.tx.salt, s->ipsec.tx.key + s->ipsec.key_len, s->ipsec.salt_len);
 	}
 
 	/* use request as template and just exchange some values */
@@ -3398,7 +3481,10 @@ void rekey_phase1(struct sa_block *s)
 	memcpy(i_cookie, s->ike.i_cookie, ISAKMP_COOKIE_LENGTH);
 	memcpy(r_cookie, s->ike.r_cookie, ISAKMP_COOKIE_LENGTH);
 
-	do_phase1_am(config[CONFIG_IPSEC_ID], config[CONFIG_IPSEC_SECRET], s, 1);
+	do_phase1_am(config[CONFIG_IPSE<<<<<<< protocol-fixes
+2671
+ 
+C_ID], config[CONFIG_IPSEC_SECRET], s, 1);
 
 	(void)do_phase2_xauth(s);
 

@@ -511,9 +511,20 @@ static struct isakmp_attribute *parse_isakmp_attributes(const uint8_t **data_p,
 			return r;
 		}
 		if (r->type == ISAKMP_MODECFG_ATTRIB_CISCO_SPLIT_INC) {
+			/*
+			 * Cisco sends 14 byte entries. strongSwan's charon omits
+			 * the protocol and the two port fields and sends 8 byte
+			 * ones, so fall back to that length when the payload is
+			 * not a whole number of Cisco entries.
+			 */
+			int ent_len = 4 + 4 + 2 + 2 + 2;
+
+			if (length % ent_len != 0 && length % (4 + 4) == 0)
+				ent_len = 4 + 4;
+
 			r->af = isakmp_attr_acl;
-			r->u.acl.count = length / (4 + 4 + 2 + 2 + 2);
-			if (r->u.acl.count * (4 + 4 + 2 + 2 + 2) != length) {
+			r->u.acl.count = length / ent_len;
+			if (r->u.acl.count * ent_len != length) {
 				*reject = ISAKMP_N_PAYLOAD_MALFORMED;
 				return r;
 			}
@@ -522,9 +533,15 @@ static struct isakmp_attribute *parse_isakmp_attributes(const uint8_t **data_p,
 			for (i = 0; i < r->u.acl.count; i++) {
 				fetchn(&r->u.acl.acl_ent[i].addr.s_addr, 4);
 				fetchn(&r->u.acl.acl_ent[i].mask.s_addr, 4);
-				r->u.acl.acl_ent[i].protocol = fetch2();
-				r->u.acl.acl_ent[i].sport = fetch2();
-				r->u.acl.acl_ent[i].dport = fetch2();
+				if (ent_len > 4 + 4) {
+					r->u.acl.acl_ent[i].protocol = fetch2();
+					r->u.acl.acl_ent[i].sport = fetch2();
+					r->u.acl.acl_ent[i].dport = fetch2();
+				} else {
+					r->u.acl.acl_ent[i].protocol = 0;
+					r->u.acl.acl_ent[i].sport = 0;
+					r->u.acl.acl_ent[i].dport = 0;
+				}
 				hex_dump("t.attributes.u.acl.addr", &r->u.acl.acl_ent[i].addr.s_addr, 4, NULL);
 				hex_dump("t.attributes.u.acl.mask", &r->u.acl.acl_ent[i].mask.s_addr, 4, NULL);
 				hex_dump("t.attributes.u.acl.protocol", &r->u.acl.acl_ent[i].protocol, DUMP_UINT16, NULL);

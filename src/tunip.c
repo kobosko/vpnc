@@ -133,7 +133,8 @@ static int encap_rawip_recv(struct sa_block *s, unsigned char *buf, unsigned int
 
 	r = recvfrom(s->esp_fd, buf, bufsize, 0, (struct sockaddr *)&from, &fromlen);
 	if (r == -1) {
-		logmsg(LOG_ERR, "recvfrom: %m");
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			logmsg(LOG_ERR, "recvfrom: %m");
 		return -1;
 	}
 	if (from.sin_addr.s_addr != s->dst.s_addr) {
@@ -167,7 +168,8 @@ static int encap_udp_recv(struct sa_block *s, unsigned char *buf, unsigned int b
 
 	r = recv(s->esp_fd, buf, bufsize, 0);
 	if (r == -1) {
-		logmsg(LOG_ERR, "recvfrom: %m");
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			logmsg(LOG_ERR, "recv: %m");
 		return -1;
 	}
 	if (s->ipsec.natt_active_mode == NATT_ACTIVE_DRAFT_OLD && r > 8) {
@@ -244,7 +246,7 @@ static int tun_send_ip(struct sa_block *s)
 /*
  * Compute HMAC for an arbitrary stream of bytes
  */
-static int hmac_compute(int md_algo,
+static int hmac_compute(int md_algo, unsigned int hmac_len,
 			const unsigned char *data, unsigned int data_size,
 			unsigned char *digest, unsigned char do_store,
 			const unsigned char *secret, unsigned short secret_size)
@@ -252,7 +254,6 @@ static int hmac_compute(int md_algo,
 	gcry_md_hd_t md_ctx;
 	int ret;
 	unsigned char *hmac_digest;
-	unsigned int hmac_len;
 
 	/* See RFC 2104 */
 	gcry_md_open(&md_ctx, md_algo, GCRY_MD_FLAG_HMAC);
@@ -262,7 +263,6 @@ static int hmac_compute(int md_algo,
 	gcry_md_write(md_ctx, data, data_size);
 	gcry_md_final(md_ctx);
 	hmac_digest = gcry_md_read(md_ctx, 0);
-	hmac_len = 12; /*gcry_md_get_algo_dlen(md_algo); see RFC .. only use 96 bit */
 
 	if (do_store) {
 		memcpy(digest, hmac_digest, hmac_len);
@@ -322,7 +322,24 @@ static void encap_esp_encapsulate(struct sa_block *s)
 
 	hex_dump("sending ESP packet (before crypt)", s->ipsec.tx.buf, s->ipsec.tx.buflen, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.aead_icv_len) {
+		/*
+		 * RFC 4106: the nonce is the salt from the key material followed
+		 * by the explicit IV carried in the packet, and the ESP header is
+		 * authenticated but not encrypted.
+		 */
+		unsigned char nonce[4 + 8];
+
+		memcpy(nonce, s->ipsec.tx.salt, s->ipsec.salt_len);
+		memcpy(nonce + s->ipsec.salt_len, iv, s->ipsec.iv_len);
+		gcry_cipher_reset(s->ipsec.tx.cry_ctx);
+		gcry_cipher_setiv(s->ipsec.tx.cry_ctx, nonce, s->ipsec.salt_len + s->ipsec.iv_len);
+		gcry_cipher_authenticate(s->ipsec.tx.cry_ctx, eh, sizeof(*eh));
+		gcry_cipher_encrypt(s->ipsec.tx.cry_ctx, cleartext, cleartextlen, NULL, 0);
+		gcry_cipher_gettag(s->ipsec.tx.cry_ctx, s->ipsec.tx.buf + s->ipsec.tx.buflen,
+				   s->ipsec.aead_icv_len);
+		s->ipsec.tx.buflen += s->ipsec.aead_icv_len;
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_setiv(s->ipsec.tx.cry_ctx, iv, s->ipsec.iv_len);
 		gcry_cipher_encrypt(s->ipsec.tx.cry_ctx, cleartext, cleartextlen, NULL, 0);
 	}
@@ -331,12 +348,12 @@ static void encap_esp_encapsulate(struct sa_block *s)
 
 	/* Handle optional authentication field */
 	if (s->ipsec.md_algo) {
-		hmac_compute(s->ipsec.md_algo,
+		hmac_compute(s->ipsec.md_algo, s->ipsec.icv_len,
 			     s->ipsec.tx.buf + s->ipsec.tx.bufpayload,
 			     s->ipsec.tx.var_header_size + cleartextlen,
 			     s->ipsec.tx.buf + s->ipsec.tx.bufpayload + s->ipsec.tx.var_header_size + cleartextlen,
 			     1, s->ipsec.tx.key_md, s->ipsec.md_len);
-		s->ipsec.tx.buflen += 12; /*gcry_md_get_algo_dlen(md_algo); see RFC .. only use 96 bit */
+		s->ipsec.tx.buflen += s->ipsec.icv_len;
 		hex_dump("sending ESP packet (after ah)", s->ipsec.tx.buf, s->ipsec.tx.buflen, NULL);
 	}
 }
@@ -563,9 +580,13 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 
 	/* Handle optional authentication field */
 	if (s->ipsec.md_algo) {
-		len -= 12; /*gcry_md_get_algo_dlen(peer->local_sa->md_algo); */
-		s->ipsec.rx.buflen -= 12;
-		if (hmac_compute(s->ipsec.md_algo,
+		len -= s->ipsec.icv_len;
+		if (len < 0) {
+			logmsg(LOG_ALERT, "Packet too short for the ICV");
+			return -1;
+		}
+		s->ipsec.rx.buflen -= s->ipsec.icv_len;
+		if (hmac_compute(s->ipsec.md_algo, s->ipsec.icv_len,
 				 s->ipsec.rx.buf + s->ipsec.rx.bufpayload,
 				 s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size + len,
 				 s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size + len,
@@ -577,6 +598,35 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 		}
 	}
 
+	if (s->ipsec.aead_icv_len) {
+		unsigned char nonce[4 + 8];
+		unsigned char *data;
+		esp_encap_header_t *eh;
+
+		len -= s->ipsec.aead_icv_len;
+		if (len < 0) {
+			logmsg(LOG_ALERT, "Packet too short for the ICV");
+			return -1;
+		}
+		s->ipsec.rx.buflen -= s->ipsec.aead_icv_len;
+
+		eh = (esp_encap_header_t *)(s->ipsec.rx.buf + s->ipsec.rx.bufpayload);
+		data = s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size +
+		    s->ipsec.rx.var_header_size;
+
+		memcpy(nonce, s->ipsec.rx.salt, s->ipsec.salt_len);
+		memcpy(nonce + s->ipsec.salt_len, iv, s->ipsec.iv_len);
+		gcry_cipher_reset(s->ipsec.rx.cry_ctx);
+		gcry_cipher_setiv(s->ipsec.rx.cry_ctx, nonce, s->ipsec.salt_len + s->ipsec.iv_len);
+		gcry_cipher_authenticate(s->ipsec.rx.cry_ctx, eh, sizeof(*eh));
+		gcry_cipher_decrypt(s->ipsec.rx.cry_ctx, data, len, NULL, 0);
+		if (gcry_cipher_checktag(s->ipsec.rx.cry_ctx, data + len, s->ipsec.aead_icv_len)) {
+			logmsg(LOG_ALERT, "ICV mismatch in ESP mode");
+			return -1;
+		}
+	}
+
+	/* Only count a packet against the replay window once it is authentic. */
 	if (encap_esp_validate_seqid(s, seq_id))
 		return -1;
 
@@ -593,7 +643,7 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 				  s->ipsec.rx.var_header_size],
 		 len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.cry_algo && !s->ipsec.aead_icv_len) {
 		unsigned char *data;
 
 		data = (s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size);
@@ -1100,7 +1150,13 @@ void vpnc_doit(struct sa_block *s)
 	s->ipsec.rx.key_md = s->ipsec.rx.key + s->ipsec.key_len;
 	hex_dump("rx.key_md", s->ipsec.rx.key_md, s->ipsec.md_len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.salt_len)
+		memcpy(s->ipsec.rx.salt, s->ipsec.rx.key + s->ipsec.key_len, s->ipsec.salt_len);
+
+	if (s->ipsec.aead_icv_len) {
+		gcry_cipher_open(&s->ipsec.rx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_GCM, 0);
+		gcry_cipher_setkey(s->ipsec.rx.cry_ctx, s->ipsec.rx.key_cry, s->ipsec.key_len);
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_open(&s->ipsec.rx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_CBC, 0);
 		gcry_cipher_setkey(s->ipsec.rx.cry_ctx, s->ipsec.rx.key_cry, s->ipsec.key_len);
 	} else {
@@ -1113,7 +1169,13 @@ void vpnc_doit(struct sa_block *s)
 	s->ipsec.tx.key_md = s->ipsec.tx.key + s->ipsec.key_len;
 	hex_dump("tx.key_md", s->ipsec.tx.key_md, s->ipsec.md_len, NULL);
 
-	if (s->ipsec.cry_algo) {
+	if (s->ipsec.salt_len)
+		memcpy(s->ipsec.tx.salt, s->ipsec.tx.key + s->ipsec.key_len, s->ipsec.salt_len);
+
+	if (s->ipsec.aead_icv_len) {
+		gcry_cipher_open(&s->ipsec.tx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_GCM, 0);
+		gcry_cipher_setkey(s->ipsec.tx.cry_ctx, s->ipsec.tx.key_cry, s->ipsec.key_len);
+	} else if (s->ipsec.cry_algo) {
 		gcry_cipher_open(&s->ipsec.tx.cry_ctx, s->ipsec.cry_algo, GCRY_CIPHER_MODE_CBC, 0);
 		gcry_cipher_setkey(s->ipsec.tx.cry_ctx, s->ipsec.tx.key_cry, s->ipsec.key_len);
 	} else {
