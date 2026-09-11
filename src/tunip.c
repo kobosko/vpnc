@@ -246,7 +246,7 @@ static int tun_send_ip(struct sa_block *s)
 /*
  * Compute HMAC for an arbitrary stream of bytes
  */
-static int hmac_compute(int md_algo,
+static int hmac_compute(int md_algo, unsigned int hmac_len,
 			const unsigned char *data, unsigned int data_size,
 			unsigned char *digest, unsigned char do_store,
 			const unsigned char *secret, unsigned short secret_size)
@@ -254,7 +254,6 @@ static int hmac_compute(int md_algo,
 	gcry_md_hd_t md_ctx;
 	int ret;
 	unsigned char *hmac_digest;
-	unsigned int hmac_len;
 
 	/* See RFC 2104 */
 	gcry_md_open(&md_ctx, md_algo, GCRY_MD_FLAG_HMAC);
@@ -264,7 +263,6 @@ static int hmac_compute(int md_algo,
 	gcry_md_write(md_ctx, data, data_size);
 	gcry_md_final(md_ctx);
 	hmac_digest = gcry_md_read(md_ctx, 0);
-	hmac_len = 12; /*gcry_md_get_algo_dlen(md_algo); see RFC .. only use 96 bit */
 
 	if (do_store) {
 		memcpy(digest, hmac_digest, hmac_len);
@@ -350,12 +348,12 @@ static void encap_esp_encapsulate(struct sa_block *s)
 
 	/* Handle optional authentication field */
 	if (s->ipsec.md_algo) {
-		hmac_compute(s->ipsec.md_algo,
+		hmac_compute(s->ipsec.md_algo, s->ipsec.icv_len,
 			     s->ipsec.tx.buf + s->ipsec.tx.bufpayload,
 			     s->ipsec.tx.var_header_size + cleartextlen,
 			     s->ipsec.tx.buf + s->ipsec.tx.bufpayload + s->ipsec.tx.var_header_size + cleartextlen,
 			     1, s->ipsec.tx.key_md, s->ipsec.md_len);
-		s->ipsec.tx.buflen += 12; /*gcry_md_get_algo_dlen(md_algo); see RFC .. only use 96 bit */
+		s->ipsec.tx.buflen += s->ipsec.icv_len;
 		hex_dump("sending ESP packet (after ah)", s->ipsec.tx.buf, s->ipsec.tx.buflen, NULL);
 	}
 }
@@ -582,9 +580,13 @@ static int encap_esp_recv_peer(struct sa_block *s, uint32_t seq_id)
 
 	/* Handle optional authentication field */
 	if (s->ipsec.md_algo) {
-		len -= 12; /*gcry_md_get_algo_dlen(peer->local_sa->md_algo); */
-		s->ipsec.rx.buflen -= 12;
-		if (hmac_compute(s->ipsec.md_algo,
+		len -= s->ipsec.icv_len;
+		if (len < 0) {
+			logmsg(LOG_ALERT, "Packet too short for the ICV");
+			return -1;
+		}
+		s->ipsec.rx.buflen -= s->ipsec.icv_len;
+		if (hmac_compute(s->ipsec.md_algo, s->ipsec.icv_len,
 				 s->ipsec.rx.buf + s->ipsec.rx.bufpayload,
 				 s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size + len,
 				 s->ipsec.rx.buf + s->ipsec.rx.bufpayload + s->ipsec.em->fixed_header_size + s->ipsec.rx.var_header_size + len,

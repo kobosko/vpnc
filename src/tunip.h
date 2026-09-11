@@ -101,7 +101,7 @@ struct sa_block {
 	struct {
 		int do_pfs;
 		int cry_algo, md_algo;
-		size_t key_len, md_len;
+		size_t key_len, md_len, icv_len;
 		size_t blk_len, iv_len;
 		size_t salt_len; /* AEAD: extra keymat past the cipher key */
 		int aead_icv_len; /* AEAD: ICV length, 0 when not AEAD */

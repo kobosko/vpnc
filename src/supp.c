@@ -31,6 +31,9 @@ const supported_algo_t supp_dh_group[] = {
 const supported_algo_t supp_hash[] = {
     {"md5", GCRY_MD_MD5, IKE_HASH_MD5, IPSEC_AUTH_HMAC_MD5, 0},
     {"sha1", GCRY_MD_SHA1, IKE_HASH_SHA, IPSEC_AUTH_HMAC_SHA, 0},
+    {"sha256", GCRY_MD_SHA256, IKE_HASH_SHA2_256, IPSEC_AUTH_HMAC_SHA2_256, 0},
+    {"sha384", GCRY_MD_SHA384, IKE_HASH_SHA2_384, IPSEC_AUTH_HMAC_SHA2_384, 0},
+    {"sha512", GCRY_MD_SHA512, IKE_HASH_SHA2_512, IPSEC_AUTH_HMAC_SHA2_512, 0},
     {NULL, 0, 0, 0, 0}};
 
 const supported_algo_t supp_crypt[] = {
@@ -59,6 +62,25 @@ const supported_algo_t supp_auth[] = {
 #endif /* 0 */
     {"hybrid(rsa)", 0, IKE_AUTH_HybridInitRSA, 0, 0},
     {NULL, 0, 0, 0, 0}};
+
+/*
+ * ICV length in bytes an ESP integrity algorithm is truncated to. RFC 2403
+ * and RFC 2404 cut MD5 and SHA-1 down to 96 bits; RFC 4868 cuts the SHA-2
+ * family to half the digest instead, so the length is no longer a constant.
+ */
+int esp_icv_len(int md_algo)
+{
+	switch (md_algo) {
+	case GCRY_MD_SHA256:
+		return 16;
+	case GCRY_MD_SHA384:
+		return 24;
+	case GCRY_MD_SHA512:
+		return 32;
+	default:
+		return 12;
+	}
+}
 
 int esp_aead_icv_len(int ipsec_sa_id)
 {

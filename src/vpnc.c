@@ -2914,6 +2914,8 @@ static void do_phase2_qm(struct sa_block *s)
 					}
 					s->ipsec.md_len = s->ipsec.md_algo ?
 					    gcry_md_get_algo_dlen(s->ipsec.md_algo) : 0;
+					s->ipsec.icv_len = s->ipsec.md_algo ?
+					    (size_t)esp_icv_len(s->ipsec.md_algo) : 0;
 					if (esp_aead)
 						DEBUG(1, printf("IPSEC SA selected %s\n", esp_cry->name));
 					else

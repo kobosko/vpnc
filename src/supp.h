@@ -36,6 +36,8 @@ extern const supported_algo_t supp_crypt[];
 extern const supported_algo_t supp_auth[];
 
 extern const supported_algo_t *get_algo(enum algo_group what, enum supp_algo_key key, int id, const char *name, int keylen);
+/* ICV length in bytes an ESP integrity algorithm is truncated to */
+extern int esp_icv_len(int md_algo);
 /* ICV length in bytes of an AEAD ESP transform, 0 if it is not one */
 extern int esp_aead_icv_len(int ipsec_sa_id);
 extern const supported_algo_t *get_dh_group_ike(void);
