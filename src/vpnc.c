@@ -3481,7 +3481,10 @@ void rekey_phase1(struct sa_block *s)
 	memcpy(i_cookie, s->ike.i_cookie, ISAKMP_COOKIE_LENGTH);
 	memcpy(r_cookie, s->ike.r_cookie, ISAKMP_COOKIE_LENGTH);
 
-	do_phase1_am(config[CONFIG_IPSEC_ID], config[CONFIG_IPSEC_SECRET], s, 1);
+	do_phase1_am(config[CONFIG_IPSE<<<<<<< protocol-fixes
+2671
+ 
+C_ID], config[CONFIG_IPSEC_SECRET], s, 1);
 
 	(void)do_phase2_xauth(s);
 
